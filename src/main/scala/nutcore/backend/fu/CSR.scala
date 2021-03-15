@@ -259,6 +259,9 @@ class CSR(implicit val p: NutCoreConfig) extends NutCoreModule with HasCSRConst{
   var extList = List('a', 's', 'i', 'u')
   if(HasMExtension){ extList = extList :+ 'm'}
   if(HasCExtension){ extList = extList :+ 'c'}
+
+  // TODO: after finished design
+  // if(HasNExtension){ extList = extList :+ 'n'}
   val misaInitVal = getMisaMxl(2) | extList.foldLeft(0.U)((sum, i) => sum | getMisaExt(i)) //"h8000000000141105".U 
   val misa = RegInit(UInt(XLEN.W), misaInitVal) 
   // MXL = 2          | 0 | EXT = b 00 0000 0100 0001 0001 0000 0101
@@ -310,6 +313,8 @@ class CSR(implicit val p: NutCoreConfig) extends NutCoreModule with HasCSRConst{
   val pmpaddr3 = RegInit(UInt(XLEN.W), 0.U) 
 
   // Superviser-Level CSRs
+  val sedeleg = RegInit(UInt(XLEN.W), 0.U)
+  val sideleg = RegInit(UInt(XLEN.W), 0.U)
 
   // val sstatus = RegInit(UInt(XLEN.W), "h00000000".U)
   val sstatusWmask = "hc6122".U
@@ -324,7 +329,7 @@ class CSR(implicit val p: NutCoreConfig) extends NutCoreModule with HasCSRConst{
   val stvec = RegInit(UInt(XLEN.W), 0.U)
   // val sie = RegInit(0.U(XLEN.W))
   val sieMask = "h222".U & mideleg
-  val sipMask  = "h222".U & mideleg
+  val sipMask = "h222".U & mideleg
   // val satp = RegInit(UInt(XLEN.W), "h8000000000087fbe".U)
   val satp = RegInit(UInt(XLEN.W), 0.U)
   val sepc = RegInit(UInt(XLEN.W), 0.U)
@@ -338,7 +343,15 @@ class CSR(implicit val p: NutCoreConfig) extends NutCoreModule with HasCSRConst{
   }
 
   // User-Level CSRs
-  val uepc = Reg(UInt(XLEN.W))
+  val ustatusRmask = "h11".U
+  val ustatusWmask = "h11".U
+  val uieMask = "h111".U & sideleg
+  val uipMask = "h111".U & sideleg
+  val uepc = RegInit(UInt(XLEN.W), 0.U)
+  val utval = Reg(UInt(XLEN.W))
+  val ucause = RegInit(UInt(XLEN.W), 0.U)
+  val utvec = RegInit(UInt(XLEN.W), 0.U)
+  val uscratch = RegInit(UInt(XLEN.W), 0.U)
 
   // Atom LR/SC Control Bits
   val setLr = WireInit(Bool(), false.B)
@@ -371,16 +384,18 @@ class CSR(implicit val p: NutCoreConfig) extends NutCoreModule with HasCSRConst{
   val mapping = Map(
 
     // User Trap Setup
-    // MaskedRegMap(Ustatus, ustatus), 
+    MaskedRegMap(Ustatus, mstatus, ustatusWmask, mstatusUpdateSideEffect, ustatusRmask),
     // MaskedRegMap(Uie, uie, 0.U, MaskedRegMap.Unwritable),
-    // MaskedRegMap(Utvec, utvec),
+    MaskedRegMap(Uie, mie, uieMask, MaskedRegMap.NoSideEffect, uieMask),
+    MaskedRegMap(Utvec, utvec),
     
     // User Trap Handling
-    // MaskedRegMap(Uscratch, uscratch),
-    // MaskedRegMap(Uepc, uepc),
-    // MaskedRegMap(Ucause, ucause),
-    // MaskedRegMap(Utval, utval),
+    MaskedRegMap(Uscratch, uscratch),
+    MaskedRegMap(Uepc, uepc),
+    MaskedRegMap(Ucause, ucause),
+    MaskedRegMap(Utval, utval),
     // MaskedRegMap(Uip, uip),
+    MaskedRegMap(Uip, mip.asUInt, uipMask, MaskedRegMap.Unwritable, uipMask),
 
     // User Floating-Point CSRs (not implemented)
     // MaskedRegMap(Fflags, fflags),
@@ -395,8 +410,8 @@ class CSR(implicit val p: NutCoreConfig) extends NutCoreModule with HasCSRConst{
     // Supervisor Trap Setup
     MaskedRegMap(Sstatus, mstatus, sstatusWmask, mstatusUpdateSideEffect, sstatusRmask),
 
-    // MaskedRegMap(Sedeleg, Sedeleg),
-    // MaskedRegMap(Sideleg, Sideleg),
+    MaskedRegMap(Sedeleg, sedeleg),
+    MaskedRegMap(Sideleg, sideleg),
     MaskedRegMap(Sie, mie, sieMask, MaskedRegMap.NoSideEffect, sieMask),
     MaskedRegMap(Stvec, stvec),
     MaskedRegMap(Scounteren, scounteren),
@@ -549,8 +564,10 @@ class CSR(implicit val p: NutCoreConfig) extends NutCoreModule with HasCSRConst{
     val tval = Mux(hasInstrPageFault, Mux(io.cfIn.crossPageIPFFix, SignExt((io.cfIn.pc + 2.U)(VAddrBits-1,0), XLEN), SignExt(io.cfIn.pc(VAddrBits-1,0), XLEN)), SignExt(dmemPagefaultAddr, XLEN))
     when(priviledgeMode === ModeM){
       mtval := tval
-    }.otherwise{
-      stval := tval
+    }.elsewhen(priviledgeMode === ModeS){
+	  stval := tval
+	}.otherwise{
+      utval := tval
     }
     Debug("[PF] %d: ipf %b tval %x := addr %x pc %x priviledgeMode %x\n", GTimer(), hasInstrPageFault, tval, SignExt(dmemPagefaultAddr, XLEN), io.cfIn.pc, priviledgeMode)
   }
@@ -678,12 +695,20 @@ class CSR(implicit val p: NutCoreConfig) extends NutCoreModule with HasCSRConst{
     mstatus := mstatusNew.asUInt
     retTarget := uepc(VAddrBits-1, 0)
   }
-
+  val delegU = Wire(Bool())
+  delegU := false.B
   when (raiseExceptionIntr) {
     val mstatusOld = WireInit(mstatus.asTypeOf(new MstatusStruct))
     val mstatusNew = WireInit(mstatus.asTypeOf(new MstatusStruct))
 
-    when (delegS) {
+   when (delegU) {
+	  ucause := causeNO
+      uepc := SignExt(io.cfIn.pc, XLEN)
+	  mstatusNew.pie.u := mstatusOld.ie.u
+	  mstatusNew.ie.u := false.B
+      priviledgeMode := ModeU
+      when(tvalWen){utval := 0.U} // TODO: should not use =/=
+	}.elsewhen (delegS) {
       scause := causeNO
       sepc := SignExt(io.cfIn.pc, XLEN)
       mstatusNew.spp := priviledgeMode
